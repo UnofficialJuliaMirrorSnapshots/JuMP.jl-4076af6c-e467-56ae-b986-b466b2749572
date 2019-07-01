@@ -1,5 +1,5 @@
+using LinearAlgebra, Test
 using JuMP
-using Test
 using OffsetArrays
 
 # For "DimensionMismatch when performing vector-matrix multiplication with custom types #988"
@@ -10,16 +10,25 @@ end
 struct MySumType{T}
     a::T
 end
+Base.copy(t::MyType) = t
 Base.one(::Type{MyType{T}}) where {T} = MyType(one(T))
 Base.zero(::Type{MySumType{T}}) where {T} = MySumType(zero(T))
 Base.zero(::MySumType{T}) where {T} = MySumType(zero(T))
 Base.transpose(t::MyType) = MyType(t.a)
 Base.transpose(t::MySumType) = MySumType(t.a)
-LinearAlgebra.adjoint(t::MySumType) = t
+LinearAlgebra.adjoint(t::Union{MyType, MySumType}) = t
 +(t1::MyT, t2::MyS) where {MyT<:Union{MyType, MySumType}, MyS<:Union{MyType, MySumType}} = MySumType(t1.a+t2.a)
 *(t1::MyType{S}, t2::T) where {S, T} = MyType(t1.a*t2)
 *(t1::S, t2::MyType{T}) where {S, T} = MyType(t1*t2.a)
 *(t1::MyType{S}, t2::MyType{T}) where {S, T} = MyType(t1.a*t2.a)
+
+function JuMP.isequal_canonical(t::MySumType, s::MySumType)
+    return JuMP.isequal_canonical(t.a, s.a)
+end
+function JuMP.isequal_canonical(x::AbstractArray{<:MySumType},
+                           y::AbstractArray{<:MySumType})
+    return size(x) == size(y) && all(JuMP.isequal_canonical.(x, y))
+end
 
 function operators_test(ModelType::Type{<:JuMP.AbstractModel}, VariableRefType::Type{<:JuMP.AbstractVariableRef})
     AffExprType = JuMP.GenericAffExpr{Float64, VariableRefType}
@@ -664,26 +673,50 @@ function operators_test(ModelType::Type{<:JuMP.AbstractModel}, VariableRefType::
         end
     end
 
-    @testset "DimensionMismatch when performing vector-matrix multiplication with custom types #988" begin
+    @testset "Custom types" begin
+        ElemT = MySumType{AffExprType}
         m = ModelType()
         @variable m Q[1:3, 1:3] PSD
 
-        x = [MyType(1), MyType(2), MyType(3)]
-        y = Q * x
-        z = x' * Q
-        ElemT = MySumType{AffExprType}
-        @test y isa Vector{ElemT}
-        @test size(y) == (3,)
-        @test z isa Adjoint{ElemT, <:Any}
-        @test size(z) == (1, 3)
-        for i in 1:3
-            # Q is symmetric
-            a = zero(AffExprType)
-            a += Q[1,i]
-            a += 2Q[2,i]
-            a += 3Q[3,i]
-            # Q[1,i] + 2Q[2,i] + 3Q[3,i] is rearranged as 2 Q[2,3] + Q[1,3] + 3 Q[3,3]
-            @test z[i].a == y[i].a == a
+        @testset "DimensionMismatch when performing vector-matrix multiplication #988" begin
+            x = [MyType(1), MyType(2), MyType(3)]
+            y = Q * x
+            z = x' * Q
+            @test y isa Vector{ElemT}
+            @test size(y) == (3,)
+            @test z isa Adjoint{ElemT, <:Any}
+            @test size(z) == (1, 3)
+            for i in 1:3
+                # Q is symmetric
+                a = zero(AffExprType)
+                a += Q[1,i]
+                a += 2Q[2,i]
+                a += 3Q[3,i]
+                # Q[1,i] + 2Q[2,i] + 3Q[3,i] is rearranged as 2 Q[2,3] + Q[1,3] + 3 Q[3,3]
+                @test z[i].a == y[i].a == a
+            end
+        end
+
+        @testset "Matrix multiplication #1990" begin
+            X = MyType.((1:3)' .+ (1:3))
+            @test_expression Q * X
+            Y = Q * X
+            @test_expression X' * Q
+            Z = X' * Q
+            @test Y isa Matrix{ElemT}
+            @test size(Y) == (3, 3)
+            @test Z isa Matrix{ElemT}
+            @test size(Z) == (3, 3)
+            @test JuMP.isequal_canonical(Z', Y)
+            @test_expression Q * X'
+            Y = Q * X'
+            @test_expression X * Q
+            Z = X * Q
+            @test Y isa Matrix{ElemT}
+            @test size(Y) == (3, 3)
+            @test Z isa Matrix{ElemT}
+            @test size(Z) == (3, 3)
+            @test JuMP.isequal_canonical(Z', Y)
         end
     end
 
@@ -699,6 +732,49 @@ function operators_test(ModelType::Type{<:JuMP.AbstractModel}, VariableRefType::
         if ModelType <: Model
             # The following check verifies that this test covers the code incrementing `operator_counter`
             @test m.operator_counter == 1
+        end
+    end
+
+    @testset "Symmetric Matrix" begin
+        m = ModelType()
+        Q = @variable(m, [1:2, 1:2], Symmetric)
+        @test_expression 2Q
+        # See https://github.com/JuliaLang/julia/issues/32374
+        @test_expression -Q
+    end
+
+    @testset "UniformScaling" begin
+        m = ModelType()
+        @testset "Scalar" begin
+            @variable(m, x)
+            @test_expression_with_string x + 2I "x + 2"
+            @test_expression_with_string (x + 1) + I "x + 2"
+            @test_expression_with_string x - 2I "x - 2"
+            @test_expression_with_string (x - 1) - I "x - 2"
+            @test_expression_with_string 2I + x "x + 2"
+            @test_expression_with_string I + (x + 1) "x + 2"
+            @test_expression_with_string 2I - x "-x + 2"
+            @test_expression_with_string I - (x - 1) "-x + 2"
+            @test_expression_with_string I * x "x"
+            @test_expression_with_string I * (x + 1) "x + 1"
+            @test_expression_with_string (x + 1) * I "x + 1"
+        end
+        @testset "Matrix $(typeof(x))" for x in [@variable(m, [1:2, 1:2]),
+                                                 @variable(m, [1:2, 1:2], Symmetric)]
+            @test_expression x + 2I
+            @test_expression (x .+ 1) + I
+            @test_expression x - 2I
+            @test_expression (x .- 1) - I
+            @test_expression 2I + x
+            @test_expression I + (x .+ 1)
+            @test_expression 2I - x
+            @test_expression I - (x .- 1)
+            @test_expression I * x
+            @test_expression I * (x .+ 1)
+            @test_expression (x .+ 1) * I
+            @test_expression (x .+ 1) + I * I
+            @test_expression (x .+ 1) + 2 * I
+            @test_expression (x .+ 1) + I * 2
         end
     end
 end

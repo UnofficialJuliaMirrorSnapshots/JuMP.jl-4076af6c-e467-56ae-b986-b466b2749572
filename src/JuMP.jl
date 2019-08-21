@@ -16,6 +16,7 @@ using SparseArrays
 import MathOptInterface
 const MOI = MathOptInterface
 const MOIU = MOI.Utilities
+const MOIBC = MOI.Bridges.Constraint
 
 import Calculus
 import DataStructures.OrderedDict
@@ -43,26 +44,6 @@ include("utils.jl")
 
 const _MOIVAR = MOI.VariableIndex
 const _MOICON{F,S} = MOI.ConstraintIndex{F,S}
-const _MOILB = _MOICON{MOI.SingleVariable,MOI.GreaterThan{Float64}}
-const _MOIUB = _MOICON{MOI.SingleVariable,MOI.LessThan{Float64}}
-const _MOIFIX = _MOICON{MOI.SingleVariable,MOI.EqualTo{Float64}}
-const _MOIINT = _MOICON{MOI.SingleVariable,MOI.Integer}
-const _MOIBIN = _MOICON{MOI.SingleVariable,MOI.ZeroOne}
-
-MOIU.@model(_MOIModel,
-            (MOI.ZeroOne, MOI.Integer),
-            (MOI.EqualTo, MOI.GreaterThan, MOI.LessThan, MOI.Interval),
-            (MOI.Zeros, MOI.Nonnegatives, MOI.Nonpositives, MOI.SecondOrderCone,
-             MOI.RotatedSecondOrderCone, MOI.GeometricMeanCone,
-             MOI.PositiveSemidefiniteConeTriangle,
-             MOI.PositiveSemidefiniteConeSquare,
-             MOI.RootDetConeTriangle, MOI.RootDetConeSquare,
-             MOI.LogDetConeTriangle, MOI.LogDetConeSquare),
-            (),
-            (MOI.SingleVariable,),
-            (MOI.ScalarAffineFunction, MOI.ScalarQuadraticFunction),
-            (MOI.VectorOfVariables,),
-            (MOI.VectorAffineFunction, MOI.VectorQuadraticFunction))
 
 """
     OptimizerFactory
@@ -141,13 +122,6 @@ abstract type AbstractModel end
 A mathematical model of an optimization problem.
 """
 mutable struct Model <: AbstractModel
-    # Special variablewise properties that we keep track of:
-    # lower bound, upper bound, fixed, integrality, binary
-    variable_to_lower_bound::Dict{_MOIVAR, _MOILB}
-    variable_to_upper_bound::Dict{_MOIVAR, _MOIUB}
-    variable_to_fix::Dict{_MOIVAR, _MOIFIX}
-    variable_to_integrality::Dict{_MOIVAR, _MOIINT}
-    variable_to_zero_one::Dict{_MOIVAR, _MOIBIN}
     # In MANUAL and AUTOMATIC modes, CachingOptimizer.
     # In DIRECT mode, will hold an AbstractOptimizer.
     moi_backend::MOI.AbstractOptimizer
@@ -192,7 +166,7 @@ function Model(; caching_mode::MOIU.CachingOptimizerMode=MOIU.AUTOMATIC,
               "later. See the JuMP documentation " *
               "(http://www.juliaopt.org/JuMP.jl/latest/) for latest syntax.")
     end
-    universal_fallback = MOIU.UniversalFallback(_MOIModel{Float64}())
+    universal_fallback = MOIU.UniversalFallback(MOIU.Model{Float64}())
     caching_opt = MOIU.CachingOptimizer(universal_fallback,
                                         caching_mode)
     return direct_model(caching_opt)
@@ -243,12 +217,7 @@ in mind the following implications of creating models using this *direct* mode:
 """
 function direct_model(backend::MOI.ModelLike)
     @assert MOI.is_empty(backend)
-    return Model(Dict{_MOIVAR, _MOILB}(),
-                 Dict{_MOIVAR, _MOIUB}(),
-                 Dict{_MOIVAR, _MOIFIX}(),
-                 Dict{_MOIVAR, _MOIINT}(),
-                 Dict{_MOIVAR, _MOIBIN}(),
-                 backend,
+    return Model(backend,
                  Dict{_MOICON, AbstractShape}(),
                  Set{Any}(),
                  nothing,
@@ -350,36 +319,36 @@ function bridge_constraints(model::Model)
 end
 
 function _moi_add_bridge(model::Nothing,
-                        BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                        BridgeType::Type{<:MOIBC.AbstractBridge})
     # No optimizer is attached, the bridge will be added when one is attached
     return
 end
 function _moi_add_bridge(model::MOI.ModelLike,
-                        BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                        BridgeType::Type{<:MOIBC.AbstractBridge})
     error("Cannot add bridge if `bridge_constraints` was set to `false` in the",
           " `Model` constructor.")
 end
 function _moi_add_bridge(bridge_opt::MOI.Bridges.LazyBridgeOptimizer,
-                        BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                        BridgeType::Type{<:MOIBC.AbstractBridge})
     MOI.Bridges.add_bridge(bridge_opt, BridgeType{Float64})
     return
 end
 function _moi_add_bridge(caching_opt::MOIU.CachingOptimizer,
-                        BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                        BridgeType::Type{<:MOIBC.AbstractBridge})
     _moi_add_bridge(caching_opt.optimizer, BridgeType)
     return
 end
 
 """
      add_bridge(model::Model,
-                BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                BridgeType::Type{<:MOIBC.AbstractBridge})
 
 Add `BridgeType` to the list of bridges that can be used to transform
 unsupported constraints into an equivalent formulation using only constraints
 supported by the optimizer.
 """
 function add_bridge(model::Model,
-                    BridgeType::Type{<:MOI.Bridges.AbstractBridge})
+                    BridgeType::Type{<:MOIBC.AbstractBridge})
     push!(model.bridge_types, BridgeType)
     # The type of `backend(model)` is not type-stable, so we use a function
     # barrier (`_moi_add_bridge`) to improve performance.
@@ -417,6 +386,16 @@ function termination_status(model::Model)
 end
 
 """
+    raw_status(model::Model)
+
+Return the reason why the solver stopped in its own words (i.e., the
+MathOptInterface model attribute `RawStatusString`).
+"""
+function raw_status(model::Model)
+    return MOI.get(model, MOI.RawStatusString())
+end
+
+"""
     primal_status(model::Model)
 
 Return the status of the most recent primal solution of the solver (i.e., the
@@ -451,9 +430,18 @@ function solve_time(model::Model)
 end
 
 """
+    set_parameter(model::Model, name, value)
+
+Sets solver-specific parameter identified by `name` to `value`.
+"""
+function set_parameter(model::Model, name, value)
+    return MOI.set(model, MOI.RawParameter(name), value)
+end
+
+"""
     set_silent(model::Model)
 
-Takes precedence over any other attribute controlling verbosity 
+Takes precedence over any other attribute controlling verbosity
 and requires the solver to produce no output.
 """
 function set_silent(model::Model)
@@ -538,7 +526,7 @@ end
 function _moi_optimizer_index(model::MOI.Bridges.LazyBridgeOptimizer,
                               index::MOI.Index)
     if index isa MOI.ConstraintIndex &&
-        MOI.Bridges.is_bridged(model, typeof(index))
+        MOI.Bridges.is_bridged(model, index)
         error("There is no `optimizer_index` for $(typeof(index)) constraints",
               " because they are bridged.")
     else
@@ -632,6 +620,14 @@ function MOI.get(model::Model, attr::MOI.AbstractModelAttribute)
     else
         MOI.get(backend(model), attr)
     end
+end
+"""
+    get(model::Model, attr::MathOptInterface.AbstractOptimizerAttribute)
+
+Return the value of the attribute `attr` from the model's MOI backend.
+"""
+function MOI.get(model::Model, attr::MOI.AbstractOptimizerAttribute)
+    MOI.get(backend(model), attr)
 end
 function MOI.get(model::Model, attr::MOI.AbstractVariableAttribute,
                  v::VariableRef)

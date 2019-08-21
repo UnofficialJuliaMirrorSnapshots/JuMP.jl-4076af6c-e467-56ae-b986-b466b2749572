@@ -52,6 +52,9 @@ This function will return a `MOI.TerminationStatusCode` `enum`.
 MOI.TerminationStatusCode
 ```
 
+Additionally, we can receive a solver specific string explaning why the
+optimization stopped with [`raw_status`](@ref).
+
 ## Solution statuses
 
 These statuses indicate what kind of result is available to be queried
@@ -164,7 +167,7 @@ julia> @objective(model, Max, x[1]);
 ```@meta
 DocTestSetup = quote
     using JuMP
-    model = Model(with_optimizer(MOIU.MockOptimizer, JuMP._MOIModel{Float64}(),
+    model = Model(with_optimizer(MOIU.MockOptimizer, MOIU.Model{Float64}(),
                   eval_variable_constraint_dual=true));
     @variable(model, x[1:2]);
     @constraint(model, c1, x[1] + x[2] <= 1);
@@ -213,6 +216,7 @@ lp_rhs_perturbation_range
 
 ```@docs
 JuMP.termination_status
+JuMP.raw_status
 JuMP.primal_status
 JuMP.has_values
 JuMP.value
